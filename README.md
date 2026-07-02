@@ -41,7 +41,6 @@ pip install -r requirements.txt
 
 The official pretrained checkpoint is available on the [Hugging Face Hub](https://huggingface.co/wenjiaGUO/VGGT-G).
 
-For source code, installation instructions, and evaluation scripts, please refer to the [GitHub repository](https://github.com/gwj212/VGGT-G).
 
 Download `ckpt.pth` and place it in the project root, or specify its location via the `CKPT_PATH` environment variable.
 
