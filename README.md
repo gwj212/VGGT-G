@@ -26,7 +26,7 @@ Key features:
 
 ### Option A: pip (local environment)
 
-We recommend Python 3.10+ and CUDA 12.4
+We recommend Python 3.10 and CUDA 12.1
 
 ```bash
 git clone https://github.com/gwj212/VGGT-G.git
@@ -35,11 +35,14 @@ cd VGGT-G
 conda create -n vggt-gaussian python=3.10 -y
 conda activate vggt-gaussian
 
-pip install -r requirements.slim.txt
+pip install -r requirements.txt
 ```
 
 ### Pretrained checkpoint
 
+Download the pretrained checkpoint `ckpt.pth` and place it at the repository root (or pass its path via the `CKPT_PATH` environment variable). It stores the trained `gaussian_head` and `dpt_feature_head` weights (~440 MB); the VGGT-1B backbone is fetched automatically from the Hugging Face Hub on first run.
+
+<!-- TODO: add the ckpt.pth download link -->
 
 ---
 
@@ -48,75 +51,78 @@ pip install -r requirements.slim.txt
 ### 1. Run the interactive web demo
 
 ```bash
-python app.py --ckpt ckpt.pth --port 7860
+CKPT_PATH=ckpt.pth PORT=7860 python app.py
 ```
 
-Then open `http://localhost:7860` in your browser. Sample images are provided under `demo_assets/`.
+Then open `http://localhost:7860` in your browser. Sample images are provided under `demo_assets/`. Useful environment variables: `PORT` (default 7860), `CKPT_PATH`, `SHARE` (set 1 for a temporary public link), `DEMO_MOCK` (set 1 to force mock mode).
 
 ### 2. Standalone demo bundle
 
-A self-contained demo package is also provided:
+A self-contained demo image is also provided, so you can run the demo without setting up a Python environment:
 
 ```bash
-tar -xzvf vggt-gaussian-demo.tar.gz -C vggt_demo/
-cd vggt_demo
-python run_demo.py --input ./examples
+gunzip -c vggt-gaussian-demo.tar.gz | sudo docker load
+sudo docker run --rm --gpus all -p 7860:7860 vggt-gaussian-demo:latest
 ```
 
-> ✏️ Confirm the exact entry-point script name inside `vggt_demo/` and `vggt-gaussian-demo.tar.gz` — update `run_demo.py` above if it differs.
+> Requires the NVIDIA driver, Docker, and `nvidia-container-toolkit` (so `--gpus all` works). See `ENVIRONMENT.md` for details.
 
 ## 🏋️ Training
 
-Training is launched via `train_nogt.py`. The `nogt` suffix indicates the **no-ground-truth-camera** training setting, where camera poses are not required as supervision (consistent with VGGT's pose-free design).
+Training is launched via `train_nogt.py`. The `nogt` suffix indicates the **no-ground-truth** training setting: the Gaussian head is trained without any ground-truth Gaussians, supervised only by a geometry-based initialization anchor, a differentiable render loss, and an opacity de-duplication term.
+
+Paths and options are passed via environment variables (each subfolder of `TRAIN_DIR` / `TEST_DIR` is one scene of multi-view images):
 
 ```bash
-python train_nogt.py \
-  --config configs/train_default.yaml \
-  --data_root /path/to/dataset \
-  --output_dir ./runs/vggt_gaussian_exp1 \
-  --batch_size 4 \
-  --num_gpus 8
+# single GPU
+CUDA_VISIBLE_DEVICES=0 \
+TRAIN_DIR=/path/to/dataset/train \
+TEST_DIR=/path/to/dataset/test \
+OUTPUT_DIR=./runs/vggt_gaussian_exp1 \
+python train_nogt.py --single
+
+# multi-GPU (DDP)
+TRAIN_DIR=/path/to/dataset/train TEST_DIR=/path/to/dataset/test \
+OUTPUT_DIR=./runs/vggt_gaussian_exp1 \
+torchrun --nproc_per_node=8 train_nogt.py
 ```
 
-Common arguments:
+Common environment variables:
 
-| Argument | Description | Default |
+| Variable | Description | Default |
 |---|---|---|
-| `--config` | Path to training config (model/data/optim settings) | `configs/train_default.yaml` |
-| `--data_root` | Root directory of the training dataset(s) | — |
-| `--output_dir` | Directory for checkpoints/logs | `./runs/exp` |
-| `--resume` | Path to a checkpoint to resume from | `None` |
-| `--num_gpus` | Number of GPUs for DDP training | `1` |
+| `TRAIN_DIR` / `TEST_DIR` | Training / test scene roots (one subfolder per scene) | — |
+| `OUTPUT_DIR` | Directory for checkpoints, renders, and the test cache | `output/nogt` |
+| `RESUME` | `auto` to resume the latest checkpoint in `OUTPUT_DIR`, or an explicit checkpoint path | `None` |
+| `MAX_IMG_SIDE` | If `>0`, downsample so the long side ≤ this many pixels (caps memory) | `0` |
+| `VGGT_XYZ_BASE_SOURCE` | Where the Gaussian centers are seeded from | `depth_unproject` |
 
-Logs and intermediate checkpoints are written to `--output_dir`; training curves can be monitored via TensorBoard:
-
-```bash
-tensorboard --logdir ./runs/vggt_gaussian_exp1
-```
-
-> ✏️ Fill in the actual CLI flags/config schema of `train_nogt.py` (this table is a reasonable placeholder based on common conventions, not verified against your script).
+Checkpoints, a text log, and periodic render previews are written to `OUTPUT_DIR`. At startup the script also writes a lightweight test cache (`OUTPUT_DIR/test_cache/*.pt`) that the reconstruction evaluation below consumes.
 
 ---
 
 ## 📊 Evaluation
 
+There are two complementary scripts. `eval.py` measures **reconstruction** quality (how faithfully the model re-renders the same views it was given, on the cached test scenes from training), while `eval_nvs.py` measures **novel-view synthesis** (rendering held-out views at ground-truth poses).
+
 ### Reconstruction / geometry evaluation
 
 ```bash
-python eval.py \
-  --ckpt ckpt.pth \
-  --data_root /path/to/test_set \
-  --output_dir ./eval_results
+CKPT_PATH=ckpt.pth \
+TEST_CACHE_DIR=output/nogt/test_cache \
+OUTPUT_DIR=./eval_results \
+python eval.py
 ```
 
 ### Novel view synthesis (NVS) evaluation
 
 ```bash
-python eval_nvs.py \
-  --ckpt ckpt.pth \
-  --data_root /path/to/test_set \
-  --output_dir ./eval_nvs_results
+DATASET_DIR=/path/to/nvs_dataset \
+CKPT_PATH=ckpt.pth \
+python eval_nvs.py
 ```
+
+`eval_nvs.py` reads a per-scene `meta.json` describing the context / held-out split (extrinsics, intrinsics, image sizes); see the header of `eval_nvs.py` for the exact schema.
 
 ## 📄 Citation
 
@@ -138,4 +144,3 @@ This project builds upon [VGGT](https://github.com/facebookresearch/vggt) and th
 
 ## 📜 License
 
-TODO: add license (e.g. MIT / Apache-2.0) consistent with the licenses of VGGT and any Gaussian Splatting rasterizer dependencies used.

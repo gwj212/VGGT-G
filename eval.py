@@ -1,5 +1,5 @@
 # Usage:
-#   CKPT_PATH=... TEST_CACHE_DIR=... OUTPUT_DIR=... python eval_only_5v.py
+#   CKPT_PATH=... TEST_CACHE_DIR=... OUTPUT_DIR=... python eval.py
 #
 # Environment variables:
 #   CKPT_PATH        path to the trained checkpoint (.pth)          [REQUIRED]
