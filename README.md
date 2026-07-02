@@ -2,7 +2,6 @@
 
 # VGGT-Gaussian: Feed-Forward 3D Gaussian Reconstruction
 
-**[Paper (IETCV, under review)](#)** | **[Project Page](#)** | **[arXiv](#)** | **[Video](#)**
 
 </div>
 
@@ -48,7 +47,7 @@ Download the pretrained checkpoint `ckpt.pth` and place it at the repository roo
 
 ## ⚡ Quickstart / Demo
 
-### 1. Run the interactive web demo
+###  Run the interactive web demo
 
 ```bash
 CKPT_PATH=ckpt.pth PORT=7860 python app.py
@@ -56,14 +55,7 @@ CKPT_PATH=ckpt.pth PORT=7860 python app.py
 
 Then open `http://localhost:7860` in your browser. Sample images are provided under `demo_assets/`. Useful environment variables: `PORT` (default 7860), `CKPT_PATH`, `SHARE` (set 1 for a temporary public link), `DEMO_MOCK` (set 1 to force mock mode).
 
-### 2. Standalone demo bundle
 
-A self-contained demo image is also provided, so you can run the demo without setting up a Python environment:
-
-```bash
-gunzip -c vggt-gaussian-demo.tar.gz | sudo docker load
-sudo docker run --rm --gpus all -p 7860:7860 vggt-gaussian-demo:latest
-```
 
 > Requires the NVIDIA driver, Docker, and `nvidia-container-toolkit` (so `--gpus all` works). See `ENVIRONMENT.md` for details.
 
@@ -81,21 +73,6 @@ TEST_DIR=/path/to/dataset/test \
 OUTPUT_DIR=./runs/vggt_gaussian_exp1 \
 python train_nogt.py --single
 
-# multi-GPU (DDP)
-TRAIN_DIR=/path/to/dataset/train TEST_DIR=/path/to/dataset/test \
-OUTPUT_DIR=./runs/vggt_gaussian_exp1 \
-torchrun --nproc_per_node=8 train_nogt.py
-```
-
-Common environment variables:
-
-| Variable | Description | Default |
-|---|---|---|
-| `TRAIN_DIR` / `TEST_DIR` | Training / test scene roots (one subfolder per scene) | — |
-| `OUTPUT_DIR` | Directory for checkpoints, renders, and the test cache | `output/nogt` |
-| `RESUME` | `auto` to resume the latest checkpoint in `OUTPUT_DIR`, or an explicit checkpoint path | `None` |
-| `MAX_IMG_SIDE` | If `>0`, downsample so the long side ≤ this many pixels (caps memory) | `0` |
-| `VGGT_XYZ_BASE_SOURCE` | Where the Gaussian centers are seeded from | `depth_unproject` |
 
 Checkpoints, a text log, and periodic render previews are written to `OUTPUT_DIR`. At startup the script also writes a lightweight test cache (`OUTPUT_DIR/test_cache/*.pt`) that the reconstruction evaluation below consumes.
 
@@ -126,7 +103,7 @@ python eval_nvs.py
 
 ## 📄 Citation
 
-If you find this work useful, please consider citing:
+<!-- If you find this work useful, please consider citing:
 
 ```bibtex
 @article{vggtgaussian2026,
@@ -136,11 +113,10 @@ If you find this work useful, please consider citing:
   year    = {2026},
   note    = {under review}
 }
-```
+``` -->
 
 ## 🙏 Acknowledgement
 
 This project builds upon [VGGT](https://github.com/facebookresearch/vggt) and the 3D Gaussian Splatting rasterizer. We thank the authors of these works for open-sourcing their code.
 
-## 📜 License
 
