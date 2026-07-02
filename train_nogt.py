@@ -1,34 +1,14 @@
-#!/usr/bin/env python3
-# train_nogt.py — 完全去 GT 的纯 geo_init 训练 (= v28 geo_init 路径剥掉所有 GT 机制)
-#
-# ============================================================
-#  与 v28 (P1_MODE=geo_init) 的差异:
-#
-#  1. ★★★ 零 GT, 零数据预处理 ★★★
-#     - 不跑 optimize_gaussians_multiview (老师), 不存 gt_gaussians / gt_opa_std。
-#     - 训练图像每步直接 load_and_preprocess_images 按需加载, 没有 train cache。
-#     - 没有 GT 质量过滤: find_scenes 出来的全部场景直接进训练 (坏场景靠 render
-#       loss 鲁棒 + 失败 step 自动 skip 兜底)。
-#
-#  2. ★ 监督只有: geo_init 冷启动锚 (scale→点距 / opacity→常数) + render loss
-#                + opacity 三项 (BCE / 熵 / 平衡)。无任何 param loss。
-#
-#  3. ★ 视角选择全程 random.sample (无 P1 锁 v0; 因为没有 GT 锚点要对齐)。
-#     phase schedule 仅用于 geo-init 强度退火 (P1=1.0 / P2=0.3 / P3=0.05)。
-#
-#  4. ★ render loss 相机参数取自当次 forward 的 extr_pred/intr_pred (与高斯同系)。
-#
-#  保留 (与 v28 一致, 为公平对比):
+#  Retained defaults:
 #     - depth_unproject xyz_base, xyz_offset=0.3, warmup 500 / factor 0.1
-#     - ColorHead 启用, dpt_feature_head 解冻并入 optimizer
-#     - 所有 loss 权重 (W_RENDER=5.0, BCE=0.3, ENT=0.05, BAL=0.1)
-#     - dedup_method='image', HARD_STOP_STEP=41600 (同 v28 算力预算)
+#     - ColorHead enabled, dpt_feature_head unfrozen and added to the optimizer
+#     - loss weights (W_RENDER=5.0, BCE=0.3, ENT=0.05, BAL=0.1)
+#     - dedup_method='image'
 #
-#  跑法 (与 scan 并行):
-#     # GPU0: 跑 depth_conf 扫描
-#     CUDA_VISIBLE_DEVICES=0 python validate_depth_conf_filter.py scan ...
-#     # GPU1: 跑本脚本 (单卡)
-#     CUDA_VISIBLE_DEVICES=1 python train_nogt.py --single
+#  Run (single GPU):
+#     CUDA_VISIBLE_DEVICES=0 python train_nogt.py --single
+#
+#  Run (DDP, e.g. torchrun):
+#     torchrun --nproc_per_node=N train_nogt.py
 # ============================================================
 
 import os
@@ -51,18 +31,21 @@ from PIL import Image
 from pathlib import Path
 
 # ============================================================
-# 配置
+# Config  (set paths via env vars or edit the defaults below)
 # ============================================================
 
-TRAIN_DIR         = "/root/vggt/my_train_20v"
-TEST_DIR          = "/root/vggt/my_test_multiview"
+# Directory of training scenes: one subdirectory per scene, each holding
+# several multi-view images. REQUIRED — set TRAIN_DIR / TEST_DIR.
+TRAIN_DIR         = os.environ.get("TRAIN_DIR", "")
+TEST_DIR          = os.environ.get("TEST_DIR", "")
 N_TEST_EVAL       = 20
 
-EXP_TAG           = "nogt"
-OUTPUT_DIR        = "/root/vggt/output/nogt_geoinit_pure"
-RENDER_DIR        = "/root/vggt/output/nogt_geoinit_pure/renders"
-# ★ 只有 test cache (轻量, 不含 GT); 训练数据无 cache。用独立目录避免与 scan 抢 cache_v1。
-TEST_CACHE_DIR    = "/root/vggt/output/nogt_geoinit_pure/test_cache"
+EXP_TAG           = os.environ.get("EXP_TAG", "nogt")
+OUTPUT_DIR        = os.environ.get("OUTPUT_DIR", "output/nogt")
+RENDER_DIR        = os.path.join(OUTPUT_DIR, "renders")
+# Test cache only (lightweight, no GT). Separate dir to avoid clashing with
+# any other cache.
+TEST_CACHE_DIR    = os.path.join(OUTPUT_DIR, "test_cache")
 
 NCCL_TIMEOUT_MINUTES = 20
 
@@ -74,8 +57,9 @@ SCENE_MAX_VIEWS   = 20
 SCENE_NUM_VIEWS   = 0
 TRAIN_VIEWS_PER_STEP = 5
 
-# ★ 训练图像长边上限 (0=不限, 与 v28 一致用到 518)。显存吃紧时设 448/392 降峰值,
-#   下采样到 14 的倍数 (VGGT patch=14)。可用环境变量 MAX_IMG_SIDE 覆盖。
+# Upper bound on the training image long side (0 = unlimited, uses 518).
+# Set 448/392 to lower the memory peak; images are downsampled to a multiple
+# of 14 (VGGT patch=14). Override with env MAX_IMG_SIDE.
 MAX_IMG_SIDE = int(os.environ.get('MAX_IMG_SIDE', '0'))
 
 TEST_MIN_VIEWS    = 2
@@ -85,9 +69,10 @@ TEST_NUM_VIEWS    = 0
 NUM_EPOCHS        = 10
 LR                = 1e-4
 
-# ★ 续训: ''/未设=从头训练; 'auto'=自动找 OUTPUT_DIR 里最新的 step ckpt; 或填具体 .pth 路径。
-#   续训会恢复 模型 / optimizer / global_step / best 指标, 只有更高 PSNR / 更低 loss
-#   才覆盖 best ckpt (重启不再一上来就把最佳 ckpt 冲掉)。用环境变量 RESUME 覆盖。
+# Resume: ''/unset = train from scratch; 'auto' = pick the latest step ckpt in
+# OUTPUT_DIR; or a concrete .pth path. Resume restores model / optimizer /
+# global_step / best metrics, and only overwrites the best ckpt on a higher
+# PSNR / lower loss. Override with env RESUME.
 RESUME_CHECKPOINT = os.environ.get('RESUME', '').strip()
 
 ENABLE_COLOR_HEAD     = True
@@ -101,7 +86,7 @@ WARMUP_STEPS  = 500
 WARMUP_FACTOR = 0.1
 XYZ_LR_MULTIPLIER = 0.5
 
-# render / opacity loss 权重 (同 v28)
+# render / opacity loss weights
 W_RENDER          = 5.0
 W_RENDER_L1       = 0.7
 W_RENDER_SSIM     = 0.3
@@ -109,7 +94,7 @@ W_OPA_BCE         = 0.3
 W_OPA_ENTROPY     = 0.05
 W_OPA_BALANCE     = 0.1
 
-# geo-init 冷启动锚 (同 v28 geo_init 默认)
+# geo-init cold-start anchor
 GEO_SCALE_K   = float(os.environ.get('GEO_SCALE_K',   '1.0'))
 GEO_OPA_CONST = float(os.environ.get('GEO_OPA_CONST', '0.5'))
 W_GEO_SCALE   = float(os.environ.get('W_GEO_SCALE',   '1.0'))
@@ -129,11 +114,13 @@ SAVE_INTERVAL     = 10000
 
 TEST_PATIENCE     = 20
 MIN_TRAIN_STEPS   = 25000
-HARD_STOP_STEP    = 41600   # 与 v28 同算力预算
+HARD_STOP_STEP    = 41600   # total compute budget (global steps)
 
 PSNR_SANE_MAX     = 55.0
 
-sys.path.insert(0, "/root/vggt")
+# repo root: this file sits at the repo root (where `import vggt` works)
+VGGT_ROOT = os.environ.get("VGGT_ROOT", os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, VGGT_ROOT)
 
 from vggt.models.vggt import VGGT, unproject_depth_to_world_torch
 from vggt.utils.load_fn import load_and_preprocess_images
@@ -149,7 +136,7 @@ if FORCE_SINGLE_GPU:
 
 
 # ============================================================
-# 日志: stdout/stderr 同时写入 .log 文件 (所有 print/log_* 自动落盘)
+# Logging: tee stdout/stderr into a .log file (all print/log_* are persisted)
 # ============================================================
 class _Tee:
     def __init__(self, *streams):
@@ -171,25 +158,25 @@ class _Tee:
 
 
 def setup_file_logging(log_dir, tag):
-    """把 sys.stdout/stderr tee 到 <log_dir>/<tag>[_rankN].log (固定名, 跨次追加不覆盖)。
-       每次启动打一条 RUN START 横幅分隔; 旧的带时间戳日志保留作历史。"""
+    """Tee sys.stdout/stderr into <log_dir>/<tag>[_rankN].log (fixed name, so
+       it is appended across runs). Print a RUN START banner at each launch."""
     rank = os.environ.get('LOCAL_RANK', os.environ.get('RANK', '0'))
     os.makedirs(log_dir, exist_ok=True)
     suffix = '' if str(rank) == '0' else f'_rank{rank}'
-    path = os.path.join(log_dir, f'{tag}{suffix}.log')      # 固定名 → 续训接着写
-    fh = open(path, 'a', buffering=1)                       # append + 行缓冲
+    path = os.path.join(log_dir, f'{tag}{suffix}.log')      # fixed name -> resume appends
+    fh = open(path, 'a', buffering=1)                       # append + line-buffered
     sys.stdout = _Tee(sys.__stdout__ or sys.stdout, fh)
     sys.stderr = _Tee(sys.__stderr__ or sys.stderr, fh)
     ts = time.strftime('%Y-%m-%d %H:%M:%S')
     print("\n" + "#" * 70, flush=True)
-    print(f"#  RUN START {ts}   (日志追加写入, 不覆盖历史)", flush=True)
+    print(f"#  RUN START {ts}   (log appended, not overwritten)", flush=True)
     print("#" * 70, flush=True)
-    print(f"[log] 控制台输出同时写入(追加): {path}", flush=True)
+    print(f"[log] console output also appended to: {path}", flush=True)
     return path
 
 
 # ============================================================
-# 分布式 (与 v28 相同)
+# Distributed
 # ============================================================
 
 def setup_ddp():
@@ -249,7 +236,7 @@ def sync_gradients_flat_masked(module, world_size, local_valid, device):
 
 
 # ============================================================
-# LPIPS / 指标 / 工具 (与 v28 相同)
+# LPIPS / metrics / utils
 # ============================================================
 
 _lpips_fn = None
@@ -360,15 +347,17 @@ def save_render_comparison(rendered, gt, step, psnr, ssim_val, save_dir, prefix=
 
 
 # ============================================================
-# Loss (无任何 GT param loss; 只有 geo-init / render / opacity)
+# Loss (no GT param loss; only geo-init / render / opacity)
 # ============================================================
 _EPS = 1e-6
 
 
 def geo_init_param_loss(pred_gaussians, xyz_base, S_sel, H, W,
                         scale_k, opa_const, w_scale, w_opa, strength):
-    """去GT 冷启动锚 (纯几何): scale→scale_k×局部点距(log空间); opacity→常数。
-       对所有选中帧的 per-pixel 高斯施加; strength = phase 退火。目标全程 detach。"""
+    """GT-free cold-start anchor (pure geometry): scale -> scale_k * local point
+       spacing (log space); opacity -> constant. Applied to the per-pixel
+       Gaussians of all selected frames; strength = phase annealing. Targets
+       are always detached."""
     scale = pred_gaussians['scale'][0, :S_sel]
     opa = pred_gaussians['opacity'][0, :S_sel]
     with torch.no_grad():
@@ -392,8 +381,9 @@ def geo_init_param_loss(pred_gaussians, xyz_base, S_sel, H, W,
 def opacity_bce_loss(pred_opacity, dedup_mask):
     B, S, HW, _ = pred_opacity.shape
     target = dedup_mask.reshape(B, S, HW, 1)
-    # ★ 消毒: dedup_mask 在退化场景可能含 NaN/Inf/越界值, 直接喂 BCE 会触发
-    #   device-side assert (target 必须在 [0,1])。先 nan_to_num + clamp。
+    # Sanitize: in degenerate scenes dedup_mask may contain NaN/Inf/out-of-range
+    # values; feeding BCE directly triggers a device-side assert (target must be
+    # in [0,1]). nan_to_num + clamp first.
     target = torch.nan_to_num(target, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
     return F.binary_cross_entropy(pred_opacity.clamp(_EPS, 1 - _EPS), target)
 
@@ -445,17 +435,17 @@ def safe_compute_dedup_mask(method, xyz_base, depth_conf, extr, intr, H, W,
                                   extrinsics=extr, intrinsics=intr, H=H, W=W)
         el = time.time() - t
         if log_timing:
-            log_all(rank, f"  [mask] step{global_step} method={method} 耗时={el:.2f}s ratio={mask.mean().item():.2f}")
+            log_all(rank, f"  [mask] step{global_step} method={method} took={el:.2f}s ratio={mask.mean().item():.2f}")
         return mask, el, None
     except Exception as e:
         el = time.time() - t
-        log_all(rank, f"  ⚠️ [mask] step{global_step} {method} 失败: {e}, 退化为 'none'")
+        log_all(rank, f"  [mask] step{global_step} {method} failed: {e}, fall back to 'none'")
         B, S, _, _, _ = xyz_base.shape
         return torch.ones(B, S, H, W, device=xyz_base.device), el, str(e)
 
 
 # ============================================================
-# 测试集预计算 (轻量, 无 GT; 与 v28 相同)
+# Test-set precompute (lightweight, no GT)
 # ============================================================
 
 def precompute_test_scene_light(model, image_paths, device, dtype, cache_path):
@@ -501,13 +491,13 @@ def precompute_test_split(model, my_scenes, device, dtype, cache_dir, rank, idx_
         try:
             precompute_test_scene_light(model, scene_imgs, device, dtype, cp)
         except Exception as e:
-            log_all(rank, f"  [precomp test] {name} 失败: {e}")
+            log_all(rank, f"  [precomp test] {name} failed: {e}")
             torch.cuda.empty_cache()
-    log_all(rank, f"  [precomp test] DONE: {len(my_scenes)} 场景 | {format_duration(time.time()-t0)}")
+    log_all(rank, f"  [precomp test] DONE: {len(my_scenes)} scenes | {format_duration(time.time()-t0)}")
 
 
 # ============================================================
-# 评估 (与 v28 相同)
+# Evaluation
 # ============================================================
 
 def evaluate_single_test_scene(model, td, device, dtype, viz_idx=None):
@@ -573,22 +563,22 @@ def evaluate_on_test_set(model, tds, device, dtype, step, render_dir, save_rende
             pass
         torch.cuda.empty_cache()
     if not psnrs:
-        return 0.0, 0.0, -1.0, "评估失败"
-    extra = f" (跳过异常 {n_bad})" if n_bad else ""
+        return 0.0, 0.0, -1.0, "eval failed"
+    extra = f" (skipped bad {n_bad})" if n_bad else ""
     return (sum(psnrs) / len(psnrs), sum(ssims) / len(ssims),
             sum(lpipss) / len(lpipss) if lpipss else -1.0,
             f"avg over {len(psnrs)} scenes{extra} | PSNR [{min(psnrs):.1f}, {max(psnrs):.1f}]")
 
 
 # ============================================================
-# Sanity check (从原图加载, 无 cache)
+# Sanity check (loads from raw images, no cache)
 # ============================================================
 
 def sanity_check_xyz_base(model, scene_imgs, device, dtype, rank):
     if rank != 0:
         return
     log_main(rank, "\n" + "=" * 70)
-    log_main(rank, "  [Sanity Check] xyz_base + dedup_mask 健康检查 (从原图)")
+    log_main(rank, "  [Sanity Check] xyz_base + dedup_mask health check (from raw images)")
     log_main(rank, "=" * 70)
     try:
         n = min(5, len(scene_imgs))
@@ -596,19 +586,19 @@ def sanity_check_xyz_base(model, scene_imgs, device, dtype, rank):
         images_input = images.unsqueeze(0)
         _, _, H, W = images.shape
     except Exception as e:
-        log_main(rank, f"  ⚠️ 加载失败: {e}"); return
+        log_main(rank, f"  load failed: {e}"); return
     model.eval()
     with torch.no_grad():
         with torch.cuda.amp.autocast(dtype=dtype):
             preds = model(images_input)
     if not all(k in preds for k in ('world_points', 'depth', 'pose_enc')):
-        log_main(rank, "  ⚠️ predictions 字段不全, 跳过"); return
+        log_main(rank, "  predictions incomplete, skip"); return
     old_xyz = preds['world_points'].float()
     extr, intr = pose_encoding_to_extri_intri(preds['pose_enc'], image_size_hw=(H, W))
     new_xyz = unproject_depth_to_world_torch(preds['depth'].float(), extr.float(), intr.float())
     rel = (old_xyz - new_xyz).norm(dim=-1).mean() / (old_xyz.norm(dim=-1).mean() + 1e-8)
     log_main(rank, f"  scene name        : {Path(scene_imgs[0]).parent.name}")
-    log_main(rank, f"  ★ relative diff   : {rel.item()*100:.1f}% of scene scale")
+    log_main(rank, f"  relative diff     : {rel.item()*100:.1f}% of scene scale")
     try:
         xyz_base = unproject_depth_to_world_torch(preds['depth'].float(), extr.float(), intr.float())
         mask = compute_dedup_mask(method=DEDUP_METHOD, xyz_base=xyz_base,
@@ -618,7 +608,7 @@ def sanity_check_xyz_base(model, scene_imgs, device, dtype, rank):
         log_main(rank, f"  dedup mask ratio  : {mask.mean().item()*100:.1f}% | "
                        f"per-frame [{','.join(f'{x*100:.0f}%' for x in pf)}] fstd {float(pf.std())*100:.2f}%")
     except Exception as e:
-        log_main(rank, f"  ⚠️ dedup_mask 检查失败: {e}")
+        log_main(rank, f"  dedup_mask check failed: {e}")
     log_main(rank, "=" * 70 + "\n")
     del preds, old_xyz, new_xyz, images_input, images
     torch.cuda.empty_cache()
@@ -635,7 +625,7 @@ def save_checkpoint(model, optimizer, step, epoch, loss_val, path, metrics=None,
             'optimizer_state_dict': optimizer.state_dict()}
     if metrics is not None:
         ckpt['metrics'] = metrics
-    if best_state is not None:                  # ★ 续训追踪: 把当前 best 指标一起存进去
+    if best_state is not None:                  # resume tracking: store current best metrics too
         ckpt['best_state'] = best_state
     torch.save(ckpt, path)
 
@@ -646,7 +636,8 @@ def _best_state(best_psnr, best_ssim, best_lpips, best_loss):
 
 
 def find_resume_checkpoint(output_dir, tag):
-    """RESUME='auto' 时挑一个 ckpt 续训: 优先 step 最大的; 否则 best_loss; 再 best_test。"""
+    """When RESUME='auto', pick a checkpoint to resume: prefer the largest step;
+       else best_loss; else best_test."""
     step_ckpts = glob.glob(os.path.join(output_dir, f"gaussian_head_step*_{tag}.pth"))
     if step_ckpts:
         def _stepnum(p):
@@ -661,12 +652,15 @@ def find_resume_checkpoint(output_dir, tag):
 
 
 def load_checkpoint_for_resume(model, optimizer, ckpt_path, output_dir, tag, device, rank):
-    """加载 模型 + optimizer 状态, 返回 (next_step, best_psnr, best_ssim, best_lpips, best_loss)。
-       - next_step = ckpt 里的 global_step + 1 (该 step 已完成, 从下一步接着跑)。
-       - best 指标优先取 ckpt['best_state'] (新格式); 旧 ckpt 无此字段时, 从同目录的
-         best_test ckpt['metrics'] 和 best_loss ckpt['loss'] 兜底, 以保护既有最佳 ckpt
-         不被续训第一次 eval 覆盖。
-       - optimizer 状态从 CPU 读入后, 张量搬到 device (否则 Adam 会 device 不一致报错)。"""
+    """Load model + optimizer state; return
+       (next_step, best_psnr, best_ssim, best_lpips, best_loss).
+       - next_step = ckpt global_step + 1 (that step is done; continue from next).
+       - best metrics come from ckpt['best_state'] (new format); for old ckpts
+         without it, fall back to best_test ckpt['metrics'] and best_loss
+         ckpt['loss'] in the same dir, so existing best checkpoints are not
+         overwritten by the first eval after resume.
+       - after loading optimizer state on CPU, move tensors to device (otherwise
+         Adam raises a device-mismatch error)."""
     ckpt = torch.load(ckpt_path, map_location='cpu')
     model.gaussian_head.load_state_dict(ckpt['gaussian_head_state_dict'])
     if 'dpt_feature_head_state_dict' in ckpt:
@@ -675,7 +669,7 @@ def load_checkpoint_for_resume(model, optimizer, ckpt_path, output_dir, tag, dev
         try:
             optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         except Exception as e:
-            log_main(rank, f"  ⚠️ optimizer 状态加载失败 ({e}), 用全新 optimizer 继续")
+            log_main(rank, f"  optimizer state load failed ({e}), continue with a fresh optimizer")
 
     next_step = int(ckpt.get('global_step', 0)) + 1
 
@@ -685,7 +679,7 @@ def load_checkpoint_for_resume(model, optimizer, ckpt_path, output_dir, tag, dev
     best_lpips = float(bs.get('best_lpips', float('inf')))
     best_loss  = float(bs.get('best_loss', float('inf')))
 
-    if not bs:    # 旧 ckpt: 从既有 best_test / best_loss ckpt 兜底, 保护它们
+    if not bs:    # old ckpt: fall back to existing best_test / best_loss to protect them
         bt = os.path.join(output_dir, f"gaussian_head_best_test_{tag}.pth")
         if os.path.exists(bt):
             try:
@@ -707,7 +701,7 @@ def load_checkpoint_for_resume(model, optimizer, ckpt_path, output_dir, tag, dev
             except Exception:
                 pass
 
-    for st in optimizer.state.values():          # 把 optimizer state 张量搬到 GPU
+    for st in optimizer.state.values():          # move optimizer state tensors to GPU
         for k, v in list(st.items()):
             if torch.is_tensor(v):
                 st[k] = v.to(device)
@@ -716,7 +710,7 @@ def load_checkpoint_for_resume(model, optimizer, ckpt_path, output_dir, tag, dev
 
 
 # ============================================================
-# 训练数据: 每步从原图按需加载 (无 cache, 无 GT)
+# Training data: load selected views per step from raw images (no cache, no GT)
 # ============================================================
 
 def _round14(x):
@@ -724,22 +718,23 @@ def _round14(x):
 
 
 def load_selected_views(scene_imgs, n_pick, device):
-    """随机选 n_pick 个视角, 只加载这几张图 (避免 H/W 跨步不一致的全集加载在长跑里的开销)。
-       返回 (images_input[1,n,3,H,W] on device, gt_images_sel list, selected, H, W)。"""
+    """Randomly pick n_pick views and load only those images (avoids the cost of
+       loading the whole set when H/W varies across steps in a long run).
+       Returns (images_input[1,n,3,H,W] on device, gt_images_sel list, selected, H, W)."""
     S_total = len(scene_imgs)
     n = min(n_pick, S_total)
     selected = random.sample(range(S_total), n)
     sel_paths = [scene_imgs[s] for s in selected]
     imgs = load_and_preprocess_images(sel_paths)            # CPU [n,3,H,W]
     n, _, H, W = imgs.shape
-    # ★ 可选下采样降显存峰值 (保持 14 的倍数; 在 CPU 上做, 不占 GPU)
+    # optional downsample to reduce peak memory (keep multiple of 14; done on CPU)
     if MAX_IMG_SIDE > 0 and max(H, W) > MAX_IMG_SIDE:
         scale = MAX_IMG_SIDE / max(H, W)
         nH, nW = _round14(H * scale), _round14(W * scale)
         try:
             imgs = F.interpolate(imgs, size=(nH, nW), mode='bilinear',
                                  align_corners=False, antialias=True)
-        except TypeError:                                   # 老版本 torch 无 antialias
+        except TypeError:                                   # older torch has no antialias
             imgs = F.interpolate(imgs, size=(nH, nW), mode='bilinear', align_corners=False)
         H, W = nH, nW
     imgs = imgs.to(device)
@@ -749,7 +744,7 @@ def load_selected_views(scene_imgs, n_pick, device):
 
 
 # ============================================================
-# 主流程
+# Main
 # ============================================================
 
 def main():
@@ -774,19 +769,19 @@ def main():
     barrier()
 
     log_main(rank, "=" * 70)
-    log_main(rank, "  VGGT GaussianHead 训练  [nogt] 完全去 GT + 无数据预处理")
-    log_main(rank, "  ★ 监督 = geo-init 锚 (scale→点距 / opa→常数) + render loss + opacity三项")
-    log_main(rank, "  ★ 无 GT param loss / 无 gt_gaussians / 无 gt_opa_std 筛选")
-    log_main(rank, "  ★ 训练图像每步从原图按需加载 (无 train cache)")
-    log_main(rank, f"  ★ 视角全程 random.sample({TRAIN_VIEWS_PER_STEP}); phase 仅退火 geo 强度 P1=1.0/P2=0.3/P3=0.05")
-    log_main(rank, f"  ★ geo: scale_k={GEO_SCALE_K} opa={GEO_OPA_CONST} w_scale={W_GEO_SCALE} w_opa={W_GEO_OPA}")
-    log_main(rank, f"  ★ Loss: RENDER={W_RENDER} BCE={W_OPA_BCE} ENT={W_OPA_ENTROPY} BAL={W_OPA_BALANCE}")
-    log_main(rank, f"  ★ HARD_STOP_STEP = {HARD_STOP_STEP} (与 v28 同算力预算)")
+    log_main(rank, "  VGGT GaussianHead training [nogt]: no GT + no data preprocessing")
+    log_main(rank, "  Supervision = geo-init anchor (scale->spacing / opa->const) + render loss + opacity trio")
+    log_main(rank, "  No GT param loss / no gt_gaussians / no gt_opa_std filtering")
+    log_main(rank, "  Training images loaded per step from raw images (no train cache)")
+    log_main(rank, f"  Views: random.sample({TRAIN_VIEWS_PER_STEP}); phase only anneals geo strength P1=1.0/P2=0.3/P3=0.05")
+    log_main(rank, f"  geo: scale_k={GEO_SCALE_K} opa={GEO_OPA_CONST} w_scale={W_GEO_SCALE} w_opa={W_GEO_OPA}")
+    log_main(rank, f"  Loss: RENDER={W_RENDER} BCE={W_OPA_BCE} ENT={W_OPA_ENTROPY} BAL={W_OPA_BALANCE}")
+    log_main(rank, f"  HARD_STOP_STEP = {HARD_STOP_STEP} (compute budget)")
     log_main(rank, f"  Output: {OUTPUT_DIR} | world_size={world_size} | dtype={dtype}")
     log_main(rank, "=" * 70)
 
-    # ---- 1. 模型 ----
-    log_main(rank, "\n[1/4] 加载 VGGT-1B...")
+    # ---- 1. model ----
+    log_main(rank, "\n[1/4] Loading VGGT-1B...")
     t0 = time.time()
     model = VGGT.from_pretrained("facebook/VGGT-1B", enable_gaussian=True).to(device)
     if hasattr(model.gaussian_head, 'frames_chunk_size'):
@@ -795,11 +790,11 @@ def main():
     if ENABLE_COLOR_HEAD:
         if hasattr(model.gaussian_head, 'enable_color_head_after_init'):
             model.gaussian_head.enable_color_head_after_init(device=device)
-            log_main(rank, "  ✓ ColorHead 已启用")
+            log_main(rank, "  ColorHead enabled")
         elif getattr(model.gaussian_head, 'color_head', None) is not None:
-            log_main(rank, "  ✓ ColorHead 已默认启用")
+            log_main(rank, "  ColorHead enabled by default")
     n_copied = copy_point_head_to_feature_head(model)
-    log_main(rank, f"  ✓ 复制 {n_copied} 个张量 point_head→dpt_feature_head [解冻]")
+    log_main(rank, f"  Copied {n_copied} tensors point_head->dpt_feature_head [unfrozen]")
     for n, p in model.named_parameters():
         if 'gaussian_head' in n:
             p.requires_grad_(True)
@@ -807,22 +802,22 @@ def main():
             p.requires_grad_(not FREEZE_DPT_FEATURE_HEAD)
         else:
             p.requires_grad_(False)
-    log_main(rank, f"  可训练参数: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    log_main(rank, f"  Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     if rank == 0:
         get_lpips_fn(device)
-    log_main(rank, f"  耗时: {format_duration(time.time()-t0)}")
+    log_main(rank, f"  elapsed: {format_duration(time.time()-t0)}")
 
-    # ---- 2. 场景列表 (无 GT 筛选, 全部进训练) ----
-    log_main(rank, "\n[2/4] 扫描训练场景 (无筛选, 无 cache)...")
+    # ---- 2. scene list (no GT filtering, all used) ----
+    log_main(rank, "\n[2/4] Scanning training scenes (no filtering, no cache)...")
     scenes = find_scenes(TRAIN_DIR, min_views=SCENE_MIN_VIEWS, max_views=SCENE_MAX_VIEWS, num_views=SCENE_NUM_VIEWS)
-    assert len(scenes) > 0
-    log_main(rank, f"  训练场景: {len(scenes)} | 平均 {sum(len(s) for s in scenes)/len(scenes):.1f} views/scene "
-                   f"(全部直接进训练, 坏场景靠 render 鲁棒 + 失败 skip)")
+    assert len(scenes) > 0, f"no training scenes found under TRAIN_DIR='{TRAIN_DIR}' (set TRAIN_DIR)"
+    log_main(rank, f"  Training scenes: {len(scenes)} | avg {sum(len(s) for s in scenes)/len(scenes):.1f} views/scene "
+                   f"(all used; bad scenes handled by render robustness + skip)")
 
-    # ---- 3. 测试集预计算 (轻量) ----
-    log_main(rank, "\n[3/4] 测试集预计算 (轻量, 无 GT)...")
+    # ---- 3. test-set precompute (lightweight) ----
+    log_main(rank, "\n[3/4] Test-set precompute (lightweight, no GT)...")
     test_scenes = find_scenes(TEST_DIR, min_views=TEST_MIN_VIEWS, max_views=TEST_MAX_VIEWS, num_views=TEST_NUM_VIEWS)
-    assert len(test_scenes) > 0
+    assert len(test_scenes) > 0, f"no test scenes found under TEST_DIR='{TEST_DIR}' (set TEST_DIR)"
     my_test = test_scenes[rank::world_size]
     my_test_idx = list(range(rank, len(test_scenes), world_size))
     barrier()
@@ -845,11 +840,11 @@ def main():
             eval_test_data = sorted(all_test_data[:N_TEST_EVAL], key=lambda d: d.get('scene_name', ''))
         else:
             eval_test_data = all_test_data
-        log_main(rank, f"  test cache: {len(all_test_data)} | 评估子集 {len(eval_test_data)}")
+        log_main(rank, f"  test cache: {len(all_test_data)} | eval subset {len(eval_test_data)}")
     barrier()
 
-    # ---- 4. 初始化 optimizer + xyz_offset + sanity ----
-    log_main(rank, "\n[4/4] 初始化 + xyz_offset / Sanity (from scratch)...")
+    # ---- 4. init optimizer + xyz_offset + sanity ----
+    log_main(rank, "\n[4/4] Init + xyz_offset / sanity (from scratch)...")
     if world_size > 1:
         for p in model.gaussian_head.parameters():
             dist.broadcast(p.data, src=0)
@@ -863,42 +858,43 @@ def main():
         fh_params = [p for p in model.dpt_feature_head.parameters() if p.requires_grad]
         if fh_params:
             param_groups.append({'params': fh_params, 'lr': LR * FEATURE_HEAD_LR_MULT, 'name': 'feat'})
-            log_main(rank, f"  ★ dpt_feature_head 入 optimizer: {sum(p.numel() for p in fh_params):,} 参数, lr={LR*FEATURE_HEAD_LR_MULT:.1e}")
+            log_main(rank, f"  dpt_feature_head added to optimizer: {sum(p.numel() for p in fh_params):,} params, lr={LR*FEATURE_HEAD_LR_MULT:.1e}")
     optimizer = optim.Adam(param_groups, weight_decay=1e-5)
 
-    # ---- 续训: 解析要恢复的 ckpt ----
+    # ---- resume: resolve the checkpoint to restore ----
     resume_path = None
     if RESUME_CHECKPOINT:
         if RESUME_CHECKPOINT.lower() == 'auto':
             resume_path = find_resume_checkpoint(OUTPUT_DIR, EXP_TAG)
             if resume_path is None:
-                log_main(rank, "  ⚠️ RESUME=auto 但 OUTPUT_DIR 下没有可续训的 ckpt, 从头训练")
+                log_main(rank, "  RESUME=auto but no resumable ckpt under OUTPUT_DIR; training from scratch")
         elif os.path.exists(RESUME_CHECKPOINT):
             resume_path = RESUME_CHECKPOINT
         else:
-            log_main(rank, f"  ⚠️ RESUME='{RESUME_CHECKPOINT}' 文件不存在, 从头训练")
+            log_main(rank, f"  RESUME='{RESUME_CHECKPOINT}' file not found; training from scratch")
 
     resume_gstep = 0
     resume_best_psnr, resume_best_ssim = 0.0, 0.0
     resume_best_lpips, resume_best_loss = float('inf'), float('inf')
     if resume_path:
-        log_main(rank, f"\n  ★★★ 续训: 从 {resume_path} 恢复")
+        log_main(rank, f"\n  Resume: restoring from {resume_path}")
         (resume_gstep, resume_best_psnr, resume_best_ssim,
          resume_best_lpips, resume_best_loss) = load_checkpoint_for_resume(
             model, optimizer, resume_path, OUTPUT_DIR, EXP_TAG, device, rank)
-        log_main(rank, f"      → 从 global_step={resume_gstep} 继续 | "
+        log_main(rank, f"      -> continue from global_step={resume_gstep} | "
                        f"best_psnr={resume_best_psnr:.3f} best_loss={resume_best_loss:.4f}")
-        log_main(rank, f"      → 只有 PSNR>{resume_best_psnr:.3f} / loss<{resume_best_loss:.4f} 才覆盖对应 best ckpt")
+        log_main(rank, f"      -> only PSNR>{resume_best_psnr:.3f} / loss<{resume_best_loss:.4f} will overwrite the corresponding best ckpt")
 
-    # ---- xyz_offset: 仅从头训练时强制覆盖; 续训保留 ckpt 里已训练好的值 ----
+    # ---- xyz_offset: force-override only when training from scratch; keep the
+    #      trained value from the ckpt on resume ----
     if not resume_path:
         old_val = gh.xyz_offset_log_scale.item()
         with torch.no_grad():
             gh.xyz_offset_log_scale.copy_(torch.tensor(XYZ_OFFSET_LOG_SCALE_OVERRIDE, device=device,
                                                        dtype=gh.xyz_offset_log_scale.dtype))
-        log_main(rank, f"  ★ xyz_offset_log_scale: {old_val:.4f} → {gh.xyz_offset_log_scale.item():.4f} (exp={math.exp(gh.xyz_offset_log_scale.item()):.3f})")
+        log_main(rank, f"  xyz_offset_log_scale: {old_val:.4f} -> {gh.xyz_offset_log_scale.item():.4f} (exp={math.exp(gh.xyz_offset_log_scale.item()):.3f})")
     else:
-        log_main(rank, f"  ★ xyz_offset_log_scale (续训保留): {gh.xyz_offset_log_scale.item():.4f} (exp={gh.xyz_offset_log_scale.exp().item():.3f})")
+        log_main(rank, f"  xyz_offset_log_scale (kept on resume): {gh.xyz_offset_log_scale.item():.4f} (exp={gh.xyz_offset_log_scale.exp().item():.3f})")
 
     if world_size > 1:
         for p in model.gaussian_head.parameters():
@@ -910,7 +906,7 @@ def main():
     sanity_check_xyz_base(model, scenes[0], device, dtype, rank)
     barrier()
 
-    # ---- Scheduler: cosine 退火到 HARD_STOP; 续训时快进到 resume_gstep ----
+    # ---- scheduler: cosine anneal to HARD_STOP; fast-forward to resume_gstep on resume ----
     sched_total = HARD_STOP_LOCAL
     warmup_sched = optim.lr_scheduler.LinearLR(optimizer, start_factor=WARMUP_FACTOR, end_factor=1.0, total_iters=WARMUP_STEPS)
     cosine_sched = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, sched_total - WARMUP_STEPS), eta_min=1e-6)
@@ -918,26 +914,27 @@ def main():
     if resume_gstep > 0:
         for _ in range(min(resume_gstep, sched_total)):
             scheduler.step()
-        log_main(rank, f"  LR scheduler 已快进到 step {resume_gstep} (lr={optimizer.param_groups[0]['lr']:.2e})")
-    log_main(rank, f"  LR 退火地平线 (local steps): {sched_total:,}")
+        log_main(rank, f"  LR scheduler fast-forwarded to step {resume_gstep} (lr={optimizer.param_groups[0]['lr']:.2e})")
+    log_main(rank, f"  LR anneal horizon (local steps): {sched_total:,}")
 
-    # ---- 训练循环 ----
-    log_main(rank, "\n[训练循环] (纯 geo_init, 零 GT, 按需加载)...")
+    # ---- training loop ----
+    log_main(rank, "\n[Training loop] (pure geo_init, no GT, on-demand loading)...")
     log_main(rank, "-" * 70)
     current_dedup = DEDUP_METHOD
     n_mask_slow = 0; MASK_SLOW_THRESHOLD = 5
-    # ★ best 指标 / global_step 从续训值起步 (从头训练时即默认值)
+    # best metrics / global_step start from resume values (defaults when from scratch)
     best_loss = resume_best_loss; best_psnr = resume_best_psnr
     best_ssim = resume_best_ssim; best_lpips = resume_best_lpips
     train_start = time.time(); step_times = []
     no_improve = 0; early_stopped = False; n_local_skip = 0
     global_step = resume_gstep
-    # ★ 续训定位: 跳过已训练过的 epoch / epoch 内已训练的场景 (每 epoch shuffle 由 epoch 决定, 可复现)
+    # resume positioning: skip already-trained epochs / scenes within the epoch
+    # (the per-epoch shuffle is seeded by epoch, so it is reproducible)
     steps_per_epoch = max(1, len(scenes) // world_size)
     start_epoch = resume_gstep // steps_per_epoch
     skip_in_epoch = resume_gstep % steps_per_epoch
     if resume_gstep > 0:
-        log_main(rank, f"  ★ 续训定位: 从 epoch {start_epoch+1}/{NUM_EPOCHS} 的第 {skip_in_epoch} 个场景接着跑\n")
+        log_main(rank, f"  resume: continue from scene {skip_in_epoch} of epoch {start_epoch+1}/{NUM_EPOCHS}\n")
 
     for epoch in range(start_epoch, NUM_EPOCHS):
         if early_stopped:
@@ -951,7 +948,7 @@ def main():
             if early_stopped:
                 break
             if global_step >= HARD_STOP_LOCAL:
-                log_main(rank, f"\n  ★★★ Hard stop (step {global_step} >= {HARD_STOP_LOCAL})")
+                log_main(rank, f"\n  Hard stop (step {global_step} >= {HARD_STOP_LOCAL})")
                 early_stopped = True; break
 
             random.seed(global_step * 7919 + 31 + rank)
@@ -986,7 +983,7 @@ def main():
                     extr_pred, intr_pred = pose_encoding_to_extri_intri(predictions['pose_enc'], image_size_hw=(H, W))
                     extr_pred = extr_pred.float(); intr_pred = intr_pred.float()
 
-                # phase 退火 geo 强度 + render 权重
+                # phase-anneal geo strength + render weight
                 if global_step < PHASE2_LOCAL:
                     geo_scale, w_render = 1.0, W_RENDER
                 elif global_step < PHASE3_LOCAL:
@@ -998,10 +995,12 @@ def main():
                     xyz_base_pred = unproject_depth_to_world_torch(predictions['depth'].float(), extr_pred, intr_pred)
                     depth_conf_pred = predictions['depth_conf'].float()
 
-                # ★ 坏场景防护: forward 在退化场景可能产出 NaN/Inf。这些值若流进 dedup
-                #   mask / BCE / render 会触发不可恢复的 device-side assert。这里在 CUDA
-                #   报错之前主动检测并 raise, 走下面已有的 skip 兜底 (不污染 CUDA context)。
-                #   单次 .item() 同步, 开销可忽略。
+                # Bad-scene guard: forward may produce NaN/Inf in degenerate
+                # scenes. If those flow into the dedup mask / BCE / render they
+                # trigger an unrecoverable device-side assert. Detect and raise
+                # here before the CUDA error, so the existing skip fallback below
+                # handles it (without corrupting the CUDA context). One .item()
+                # sync, negligible cost.
                 with torch.no_grad():
                     _g = predictions['gaussians']
                     _ok = (torch.isfinite(xyz_base_pred).all()
@@ -1012,7 +1011,7 @@ def main():
                 if not bool(_ok.item()):
                     raise RuntimeError("nonfinite_pred")
 
-                # geo-init 冷启动锚
+                # geo-init cold-start anchor
                 l_geo = torch.tensor(0.0, device=device)
                 if geo_scale > 0:
                     l_geo, geo_scl_val, geo_opa_val = geo_init_param_loss(
@@ -1027,7 +1026,7 @@ def main():
                 if mask_el > DEDUP_TIMEOUT_SEC:
                     n_mask_slow += 1
                     if n_mask_slow >= MASK_SLOW_THRESHOLD and current_dedup != 'none':
-                        log_all(rank, f"  ⚠️ mask 累计超时, 切到 'none'"); current_dedup = 'none'
+                        log_all(rank, f"  mask consistently slow, switch to 'none'"); current_dedup = 'none'
 
                 pred_opa = predictions['gaussians']['opacity'].float()
                 l_bce = opacity_bce_loss(pred_opa, dedup_mask)
@@ -1074,7 +1073,7 @@ def main():
                 avg_r_value = float(avg_r.item())
                 del pred_scene
                 if n_render_ok == 0:
-                    log_all(rank, f"  ⚠️ render 全失败 step{global_step} S={S_sel} H={H} W={W}")
+                    log_all(rank, f"  render all failed step{global_step} S={S_sel} H={H} W={W}")
                     raise RuntimeError("render_all_failed")
 
                 loss = (l_geo + w_render * avg_r
@@ -1087,33 +1086,34 @@ def main():
                 bad_scene = scenes[data_idx][0] if 0 <= data_idx < len(scenes) else '?'
                 bad_name = Path(bad_scene).parent.name if bad_scene != '?' else '?'
                 if 'device-side assert' in es or 'cuda error' in es or 'illegal memory access' in es:
-                    # ★ 不可恢复: CUDA context 已损坏, 连 empty_cache 都会再抛同样的错。
-                    #   打印肇事场景后干净退出, 不再做任何 CUDA 调用。
+                    # Unrecoverable: the CUDA context is corrupted; even
+                    # empty_cache re-raises the same error. Print the offending
+                    # scene and exit cleanly, without any further CUDA calls.
                     log_all(rank, "\n" + "=" * 70)
-                    log_all(rank, f"  ✗✗✗ 不可恢复的 CUDA 错误 @ step{global_step} — 进程退出")
-                    log_all(rank, f"      肇事场景: {bad_scene}")
-                    log_all(rank, f"      场景目录: {Path(bad_scene).parent}  (S_total={S_total} H={H} W={W})")
-                    log_all(rank, f"      原始错误: {e}")
-                    log_all(rank, "      建议: ① 把该场景目录从 TRAIN_DIR 移走再重训; 或")
-                    log_all(rank, "            ② 等 depth_conf scan 跑完, 加筛选挡掉这类坏场景; 或")
-                    log_all(rank, "            ③ 用 CUDA_LAUNCH_BLOCKING=1 重跑定位真正的 kernel。")
+                    log_all(rank, f"  Unrecoverable CUDA error @ step{global_step} — exiting")
+                    log_all(rank, f"      offending scene: {bad_scene}")
+                    log_all(rank, f"      scene dir: {Path(bad_scene).parent}  (S_total={S_total} H={H} W={W})")
+                    log_all(rank, f"      original error: {e}")
+                    log_all(rank, "      Suggestions: (1) move this scene dir out of TRAIN_DIR and retrain; or")
+                    log_all(rank, "                   (2) add a filter to exclude such bad scenes; or")
+                    log_all(rank, "                   (3) rerun with CUDA_LAUNCH_BLOCKING=1 to locate the offending kernel.")
                     log_all(rank, "=" * 70)
                     sys.stdout.flush()
-                    os._exit(1)          # 硬退出, 不触碰已损坏的 CUDA/NCCL
+                    os._exit(1)          # hard exit; do not touch the corrupted CUDA/NCCL state
                 elif 'out of memory' in es:
-                    log_all(rank, f"  ⚠️ OOM step{global_step} S={S_sel} H={H} W={W} 场景={bad_name}, skip")
+                    log_all(rank, f"  OOM step{global_step} S={S_sel} H={H} W={W} scene={bad_name}, skip")
                     n_local_skip += 1
                     torch.cuda.empty_cache()
                 elif 'nonfinite_pred' in es:
-                    log_all(rank, f"  ⚠️ step{global_step} 跳过 (forward 出 NaN/Inf) 场景={bad_name}")
+                    log_all(rank, f"  step{global_step} skipped (forward produced NaN/Inf) scene={bad_name}")
                     n_local_skip += 1
                     torch.cuda.empty_cache()
                 elif 'render_all_failed' in es:
-                    log_all(rank, f"  ⚠️ step{global_step} 跳过 (render 全失败) 场景={bad_name}")
+                    log_all(rank, f"  step{global_step} skipped (render all failed) scene={bad_name}")
                     n_local_skip += 1
                     torch.cuda.empty_cache()
                 else:
-                    log_all(rank, f"  ⚠️ step{global_step} 失败 场景={bad_name}: {e}")
+                    log_all(rank, f"  step{global_step} failed scene={bad_name}: {e}")
                     n_local_skip += 1
                     torch.cuda.empty_cache()
 
@@ -1140,15 +1140,15 @@ def main():
                     sel_str = ','.join(str(x) for x in selected[:5])
                     log_main(rank,
                              f"  [nogt|{phase}|{wm}] step{global_step:7d} ep{epoch+1}/{NUM_EPOCHS} | L={loss.item():.3f} "
-                             f"rnd={avg_r_value:.3f}({n_render_ok}/{S_sel}v) ★geo=s{geo_scl_val:.2f}/o{geo_opa_val:.2f} "
+                             f"rnd={avg_r_value:.3f}({n_render_ok}/{S_sel}v) geo=s{geo_scl_val:.2f}/o{geo_opa_val:.2f} "
                              f"bce={bce_val:.3f} ent={ent_val:.3f} bal={bal_val:.4f}\n"
                              f"               mask={mask_ratio:.2f}({current_dedup},{mask_el:.2f}s) fstd={frame_std:.3f} "
                              f"surf={surf_val:.3f} mid={mid_val:.3f} fog={fog_val:.3f} opa_pf=[{pf_str}] "
-                             f"xyz_off={xyz_off:.3f} ★cd={cd_val:.4f} sel=[{sel_str}] "
+                             f"xyz_off={xyz_off:.3f} cd={cd_val:.4f} sel=[{sel_str}] "
                              f"valid={n_valid}/{world_size} lskip={n_local_skip} S={S_sel}/{S_total} H={H} W={W} "
                              f"lr={cur_lr:.1e}{mem} | {format_duration(elapsed)}/{format_duration(remaining)}")
                 else:
-                    log_main(rank, f"  [nogt|{phase}|{wm}] step{global_step:7d} ★rank0 SKIPPED★ "
+                    log_main(rank, f"  [nogt|{phase}|{wm}] step{global_step:7d} rank0 SKIPPED "
                                    f"valid={n_valid}/{world_size} lskip={n_local_skip} | {format_duration(elapsed)}/{format_duration(remaining)}")
 
             if local_valid and loss is not None:
@@ -1179,7 +1179,7 @@ def main():
                         no_improve += 1
                     lps = f" LPIPS={lp:.4f}" if lp >= 0 else ""
                     blps = f" LPIPS={best_lpips:.4f}" if best_lpips < float('inf') else ""
-                    log_main(rank, f"    ★ [nogt] Eval ({len(eval_test_data)}场景): PSNR={p:.2f}dB SSIM={s:.4f}{lps} "
+                    log_main(rank, f"    Eval ({len(eval_test_data)} scenes): PSNR={p:.2f}dB SSIM={s:.4f}{lps} "
                                    f"(best: {best_psnr:.2f}dB{blps}) [no_imp={no_improve}/{TEST_PATIENCE}] {summary}")
                     if is_best_loss:
                         save_checkpoint(model, optimizer, global_step, epoch, cur_loss,
@@ -1196,7 +1196,7 @@ def main():
                     dist.broadcast(stop, src=0)
                 if stop.item() == 1:
                     early_stopped = True
-                    log_main(rank, f"\n  ★★★ 早停 (local step {global_step})"); break
+                    log_main(rank, f"\n  Early stop (local step {global_step})"); break
                 barrier(); model.train()
             elif is_save or is_best_loss:
                 if rank == 0:
@@ -1212,11 +1212,11 @@ def main():
                     barrier()
 
             global_step += 1
-            # ★ 显式释放本步所有大张量再清缓存。empty_cache 只还"未被引用"的碎片,
-            #   被局部变量引用的张量不会还。之前只 del predictions/loss, 导致
-            #   pred_scene / xyz_base_pred / dedup_mask 等积压到下一步, 一旦某步 OOM
-            #   就连环传染。这里逐个字面量 del (未定义会抛 NameError, 忽略即可;
-            #   注意: locals() 删除 / exec('del x') 在函数作用域内都无效, 必须字面量 del)。
+            # Explicitly free all large tensors of this step before clearing the
+            # cache. empty_cache only returns unreferenced fragments; tensors still
+            # bound to locals are kept. Delete each by literal name (a NameError on
+            # an undefined name is ignored; note that deleting via locals()/exec
+            # inside a function scope does not work — literal del is required).
             try: del predictions
             except Exception: pass
             try: del pred_scene
@@ -1247,25 +1247,24 @@ def main():
 
         if not early_stopped:
             barrier()
-            log_main(rank, f"\n  === [nogt] Epoch {epoch+1}/{NUM_EPOCHS} 完成 | local step {global_step} | {format_duration(time.time()-train_start)} ===\n")
+            log_main(rank, f"\n  === Epoch {epoch+1}/{NUM_EPOCHS} done | local step {global_step} | {format_duration(time.time()-train_start)} ===\n")
 
-    # ---- 最终评估 ----
+    # ---- final evaluation ----
     barrier()
     if rank == 0 and all_test_data is not None:
-        log_main(rank, f"\n  ★ [nogt] 最终完整评估: {len(all_test_data)} 个测试场景...")
+        log_main(rank, f"\n  Final full evaluation: {len(all_test_data)} test scenes...")
         fp, fs, flp, _ = evaluate_on_test_set(model, all_test_data, device, dtype, global_step, RENDER_DIR,
                                               save_renders=min(len(all_test_data), 20))
         log_main(rank, "\n" + "=" * 70)
-        log_main(rank, "  [nogt] 训练完成! (完全去 GT + 无数据预处理)")
+        log_main(rank, "  Training complete! (no GT + no data preprocessing)")
         log_main(rank, "=" * 70)
-        log_main(rank, f"  ---------- 最终 (全 {len(all_test_data)} 场景) ----------")
+        log_main(rank, f"  ---------- Final (all {len(all_test_data)} scenes) ----------")
         log_main(rank, f"  PSNR : {fp:.4f} dB | SSIM : {fs:.6f} | LPIPS: {flp:.6f}")
-        log_main(rank, f"  ---------- 训练中最佳 ({len(eval_test_data)} 场景) ----------")
+        log_main(rank, f"  ---------- Best during training ({len(eval_test_data)} scenes) ----------")
         log_main(rank, f"  PSNR : {best_psnr:.4f} dB | SSIM : {best_ssim:.6f}"
                        + (f" | LPIPS: {best_lpips:.6f}" if best_lpips < float('inf') else ""))
-        log_main(rank, f"  训练耗时 : {format_duration(time.time()-train_start)}")
-        log_main(rank, f"  最佳 ckpt: {os.path.join(OUTPUT_DIR, f'gaussian_head_best_test_{EXP_TAG}.pth')}")
-        log_main(rank, "  对比基线 : v28 (geo_init + gt_opa_std 筛选) 全集 23.31 / 最佳子集 24.23 dB")
+        log_main(rank, f"  Training time : {format_duration(time.time()-train_start)}")
+        log_main(rank, f"  Best ckpt: {os.path.join(OUTPUT_DIR, f'gaussian_head_best_test_{EXP_TAG}.pth')}")
         log_main(rank, "=" * 70)
 
     barrier()
