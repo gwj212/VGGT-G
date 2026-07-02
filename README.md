@@ -39,9 +39,9 @@ pip install -r requirements.txt
 
 ## Pretrained Checkpoint
 
-The official pretrained checkpoint is available on the Hugging Face Hub:
+The official pretrained checkpoint is available on the [Hugging Face Hub](https://huggingface.co/wenjiaGUO/VGGT-G).
 
-**https://huggingface.co/wenjiaGUO/VGGT-G**
+For source code, installation instructions, and evaluation scripts, please refer to the [GitHub repository](https://github.com/gwj212/VGGT-G).
 
 Download `ckpt.pth` and place it in the project root, or specify its location via the `CKPT_PATH` environment variable.
 
@@ -62,8 +62,8 @@ CKPT_PATH=ckpt.pth PORT=7860 python app.py
 Then open `http://localhost:7860` in your browser. Sample images are provided under `demo_assets/`. Useful environment variables: `PORT` (default 7860), `CKPT_PATH`, `SHARE` (set 1 for a temporary public link), `DEMO_MOCK` (set 1 to force mock mode).
 
 
-
-> Requires the NVIDIA driver, Docker, and `nvidia-container-toolkit` (so `--gpus all` works). See `ENVIRONMENT.md` for details.
+<!-- 
+> Requires the NVIDIA driver, Docker, and `nvidia-container-toolkit` (so `--gpus all` works). See `ENVIRONMENT.md` for details. -->
 
 ## 🏋️ Training
 
@@ -106,8 +106,8 @@ python eval_nvs.py
 ```
 
 `eval_nvs.py` reads a per-scene `meta.json` describing the context / held-out split (extrinsics, intrinsics, image sizes); see the header of `eval_nvs.py` for the exact schema.
-
-## 📄 Citation
+<!-- 
+## 📄 Citation -->
 
 <!-- If you find this work useful, please consider citing:
 
