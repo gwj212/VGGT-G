@@ -37,9 +37,15 @@ conda activate vggt-gaussian
 pip install -r requirements.txt
 ```
 
-### Pretrained checkpoint
+## Pretrained Checkpoint
 
-Download the pretrained checkpoint `ckpt.pth` and place it at the repository root (or pass its path via the `CKPT_PATH` environment variable). It stores the trained `gaussian_head` and `dpt_feature_head` weights (~440 MB); the VGGT-1B backbone is fetched automatically from the Hugging Face Hub on first run.
+The official pretrained checkpoint is available on the Hugging Face Hub:
+
+**https://huggingface.co/wenjiaGUO/VGGT-G**
+
+Download `ckpt.pth` and place it in the project root, or specify its location via the `CKPT_PATH` environment variable.
+
+The checkpoint contains the trained weights for the `gaussian_head` and `dpt_feature_head` modules (~440 MB). The VGGT-1B backbone is automatically downloaded from the Hugging Face Hub on the first run.
 
 <!-- TODO: add the ckpt.pth download link -->
 
