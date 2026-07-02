@@ -1,8 +1,8 @@
-# vggt/losses/gaussian_lossv5.py
+# vggt/losses/gaussian_loss.py
 # ============================================================
-# v5 改动 (相对 v4):
-#   ★ opacity_loss 替换为 BCE + entropy + balance (基于 dedup_mask)
-#   ★ 保留 xyz / scale loss
+# Gaussian losses:
+#   - opacity loss  = BCE (against dedup mask) + entropy + per-frame balance
+#   - optional xyz / scale losses (used only when ground-truth is provided)
 # ============================================================
 
 import torch
@@ -14,7 +14,7 @@ from vggt.losses.dedup_mask import compute_dedup_mask
 _EPS = 1e-6
 
 
-# ─────────── 保留的 xyz / scale loss ───────────
+# ─────────── xyz / scale losses ───────────
 
 def chamfer_distance_loss(pc1, pc2):
     diff = pc1.unsqueeze(1) - pc2.unsqueeze(0)
@@ -39,12 +39,12 @@ def scale_loss(pred_scale, gt_scale):
     return F.l1_loss(pred_log.mean() / std, gt_log.mean() / std)
 
 
-# ─────────── 新 opacity loss 三件套 ───────────
+# ─────────── opacity loss trio ───────────
 
 def opacity_bce_loss(pred_opacity, dedup_mask):
     """
-    pred_opacity: (B, S, HW, 1) ∈ [0,1]
-    dedup_mask:   (B, S, H, W) ∈ {0,1}
+    pred_opacity: (B, S, HW, 1) in [0, 1]
+    dedup_mask:   (B, S, H, W) in {0, 1}
     """
     B, S, HW, _ = pred_opacity.shape
     target = dedup_mask.reshape(B, S, HW, 1)
@@ -60,14 +60,15 @@ def opacity_entropy_loss(pred_opacity):
 
 
 def opacity_balance_loss(pred_opacity, k=20.0):
-    """防 f0 垄断: per-frame surface count 均衡."""
+    """Prevent one frame from monopolising the surface: balance the per-frame
+    (soft) surface count across frames."""
     B, S, HW, _ = pred_opacity.shape
     soft_surf = torch.sigmoid((pred_opacity - 0.5) * k).sum(dim=2).squeeze(-1)
     target = soft_surf.mean(dim=1, keepdim=True)
     return ((soft_surf - target) ** 2 / (target.pow(2) + _EPS)).mean()
 
 
-# ─────────── 综合 ───────────
+# ─────────── combined ───────────
 
 def gaussian_loss_v5(
     pred: Dict[str, torch.Tensor],
@@ -82,17 +83,17 @@ def gaussian_loss_v5(
 ) -> Dict[str, torch.Tensor]:
     """
     Args:
-        pred: GaussianHead 输出 {xyz, rotation, scale, opacity, color}
-        gt:   旧 GT (用于 xyz/scale loss). opacity 不再用 GT
-        extra_inputs: 必含 {xyz_base, depth_conf, extrinsics, intrinsics, H, W}
+        pred:  GaussianHead output {xyz, rotation, scale, opacity, color}
+        gt:    optional ground-truth (for xyz/scale losses). Opacity uses no GT.
+        extra_inputs: must contain {xyz_base, depth_conf, extrinsics, intrinsics, H, W}
     """
     assert extra_inputs is not None, \
-        "需要 extra_inputs (xyz_base/depth_conf/extr/intr/H/W)"
+        "extra_inputs required (xyz_base/depth_conf/extr/intr/H/W)"
 
     losses = {}
     device = pred['xyz'].device
 
-    # ─── xyz / scale loss (保留) ───
+    # ─── xyz / scale losses (only if GT given) ───
     if gt is not None and 'xyz' in gt:
         losses['xyz'] = xyz_loss(pred['xyz'], gt['xyz'])
     else:
@@ -103,7 +104,7 @@ def gaussian_loss_v5(
     else:
         losses['scale'] = torch.tensor(0.0, device=device)
 
-    # ─── 计算 mask ───
+    # ─── dedup mask ───
     dedup_mask = compute_dedup_mask(
         method=dedup_method,
         xyz_base=extra_inputs['xyz_base'],
@@ -114,7 +115,7 @@ def gaussian_loss_v5(
         W=extra_inputs['W'],
     )
 
-    # ─── 三件套 ───
+    # ─── opacity trio ───
     losses['opa_bce'] = opacity_bce_loss(pred['opacity'], dedup_mask)
     losses['opa_entropy'] = opacity_entropy_loss(pred['opacity'])
     losses['opa_balance'] = opacity_balance_loss(pred['opacity'])
@@ -126,7 +127,7 @@ def gaussian_loss_v5(
              + w_opa_balance * losses['opa_balance'])
     losses['total'] = total
 
-    # ─── 监控指标 ───
+    # ─── monitoring metrics ───
     with torch.no_grad():
         losses['mask_mean'] = dedup_mask.mean()
         per_frame = dedup_mask.mean(dim=(0, 2, 3))  # (S,)

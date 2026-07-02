@@ -1,19 +1,3 @@
-# vggt/heads/gaussian_head.py  — v16 (v15 + ColorHead 可学性修复)
-#
-# 相对 v15 的唯一改动:
-#   ★ ColorHead 最后一层不再 zero init, 改为极小随机(std=1e-3)。
-#     原因: zero init 让 delta 初期严格=0, 起步梯度极弱, 实测 color_delta_norm 长期
-#     卡在 ~0.01(几乎没学)。改极小随机后: 初期 color≈input(delta~1e-3 可忽略), 但
-#     color head 一开始就有可观梯度, 能真正学起来。
-#
-#   ⚠ 注意(续训场景): 若从 ckpt resume, color_head 权重由 ckpt 覆盖, 本 init 改动不生效;
-#     此时让颜色学起来的真正杠杆是训练脚本里的 COLOR_LR_MULTIPLIER(调大), 或在 load
-#     之后手动重置 color_head(见训练脚本说明)。本改动主要利好"从头/重置训练 color"。
-#
-#   ★ 定位: 颜色只值 +3.65dB(color_refit 实测)且对重建/新视角(heldout)零贡献,
-#     所以这是次要项, 主路径是 vggt.py 里解开几何。
-#
-# 其余与 v15 完全一致。
 
 import torch
 import torch.nn as nn
@@ -23,7 +7,7 @@ from typing import Dict
 
 
 class ResidualBlock(nn.Module):
-    """带 GroupNorm + GELU 的残差卷积块"""
+    """Residual conv block with GroupNorm + GELU."""
     def __init__(self, channels: int):
         super().__init__()
         self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
@@ -40,7 +24,7 @@ class ResidualBlock(nn.Module):
 
 
 class AttributeHead(nn.Module):
-    """独立的属性预测头: 2层 1x1 conv (in→mid→out_dim)"""
+    """Independent attribute head: two 1x1 convs (in -> mid -> out_dim)."""
     def __init__(self, in_channels: int, out_dim: int, mid_channels: int = 64):
         super().__init__()
         self.net = nn.Sequential(
@@ -54,18 +38,18 @@ class AttributeHead(nn.Module):
 
 
 # ============================================================
-# ColorHead (v16: 极小随机 init)
+# ColorHead
 # ============================================================
 
-# ★ v16: color head 最后一层的 init std。1e-3 足够小, 初期 color≈input;
-#   但比 0 有梯度, 能学起来。
+
 COLOR_HEAD_INIT_STD = 1e-3
 
 
 class ColorHead(nn.Module):
-    """
-    残差 color head, 输出 color = sigmoid(logit(input_rgb) + delta).
-      - v16: 最后一层 weight 用极小随机(std=1e-3), bias=0 → 初期 delta≈0 但有梯度。
+    """Residual color head: color = sigmoid(logit(input_rgb) + delta).
+
+    The last layer uses a tiny-random weight (std=1e-3) and zero bias, so the
+    residual delta starts ~0 but still has gradient.
     """
     def __init__(self, in_channels: int, mid_channels: int = 64):
         super().__init__()
@@ -74,7 +58,6 @@ class ColorHead(nn.Module):
             nn.GELU(),
             nn.Conv2d(mid_channels, 3, 1, bias=True),
         )
-        # ★ v16: 极小随机 init (取代 zero init), 让 color 一开始就有梯度
         nn.init.normal_(self.head[-1].weight, std=COLOR_HEAD_INIT_STD)
         nn.init.zeros_(self.head[-1].bias)
 
@@ -88,7 +71,7 @@ class ColorHead(nn.Module):
 
 
 class GaussianHead(nn.Module):
-    """从 DPT feature_only 输出预测每像素 3D Gaussian 属性。(接口与 v15 一致)"""
+    """Predict per-pixel 3D Gaussian attributes from DPT feature_only output."""
 
     def __init__(
         self,
@@ -140,7 +123,7 @@ class GaussianHead(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """精心初始化，确保训练初期输出合理"""
+        """Careful init so the output is reasonable at the start of training."""
         last_conv = self.xyz_head.net[-1]
         nn.init.zeros_(last_conv.weight)
         nn.init.zeros_(last_conv.bias)
@@ -158,15 +141,14 @@ class GaussianHead(nn.Module):
         nn.init.zeros_(last_conv.weight)
         nn.init.constant_(last_conv.bias, 2.0)
 
-        # ★ v16: ColorHead 改极小随机(取代 zero init)
         if self.color_head is not None:
             nn.init.normal_(self.color_head.head[-1].weight, std=COLOR_HEAD_INIT_STD)
             nn.init.zeros_(self.color_head.head[-1].bias)
 
     def enable_color_head_after_init(self, device=None, dtype=None):
-        """在模型已创建后动态启用 color head (用于 from_pretrained 后再启用)。"""
+        """Enable the color head after the model is built (e.g. after from_pretrained)."""
         if self.color_head is not None:
-            print("[GaussianHead] color_head 已存在, skip enable")
+            print("[GaussianHead] color_head already exists, skip enable")
             return
 
         if device is None:
@@ -180,22 +162,22 @@ class GaussianHead(nn.Module):
         ).to(device=device, dtype=dtype)
         self.enable_color_head = True
 
-        # ★ v16: 极小随机 init (取代 zero init)
         nn.init.normal_(self.color_head.head[-1].weight, std=COLOR_HEAD_INIT_STD)
         nn.init.zeros_(self.color_head.head[-1].bias)
 
         n_params = sum(p.numel() for p in self.color_head.parameters())
-        print(f"[GaussianHead] ✓ ColorHead 已启用 ({n_params:,} params, "
+        print(f"[GaussianHead] ColorHead enabled ({n_params:,} params, "
               f"std={COLOR_HEAD_INIT_STD} init)")
 
     def reset_color_head(self):
-        """★ v16 新增: 续训时若想让卡住的 color_head 重新开始学, 调它重置最后一层。"""
+        """Reset the color head's last layer (useful when resuming a run whose
+        color_head has stopped learning)."""
         if self.color_head is None:
-            print("[GaussianHead] 无 color_head 可重置")
+            print("[GaussianHead] no color_head to reset")
             return
         nn.init.normal_(self.color_head.head[-1].weight, std=COLOR_HEAD_INIT_STD)
         nn.init.zeros_(self.color_head.head[-1].bias)
-        print(f"[GaussianHead] ✓ color_head 末层已重置 (std={COLOR_HEAD_INIT_STD})")
+        print(f"[GaussianHead] color_head last layer reset (std={COLOR_HEAD_INIT_STD})")
 
     def _trunk(self, dpt_feat_chunk, xyz_base_chunk_chw):
         xyz_proj = self.xyz_proj(xyz_base_chunk_chw)

@@ -1,0 +1,1 @@
+# vggt_demo package: helper modules for the VGGT-Gaussian Gradio demo

@@ -1,30 +1,4 @@
 #!/usr/bin/env python3
-"""
-xyz_consistency.py - 跨帧 xyz 一致性 loss
-
-核心思想:
-    dedup_mask 告诉我们每个像素谁是 winner (mask=1) 谁是 loser (mask=0).
-    Loser 像素的 3D 点应该和它在 winner 帧里的"对应表面"位置一致.
-    我们把 loser 的 xyz 拉向 winner 表面上的对应点 (winner.detach()),
-    单向拉力, 让跨帧 xyz 收敛到统一表面.
-
-设计:
-    1. Winner gradient detach (anchor)
-    2. 对每个 loser 像素, 用其 xyz 投影到所有 winner 帧, 找投影像素的
-       winner xyz 作为目标
-    3. 距离用 L1 / scene_scale (尺度无关)
-    4. mask 全 0 或全 1 的帧跳过
-
-接入:
-    from vggt.losses.xyz_consistency import compute_xyz_consistency_loss
-    l_xyz_cons = compute_xyz_consistency_loss(
-        pred_xyz=predictions['gaussians']['xyz'],  # (B, S, H*W, 3)
-        dedup_mask=dedup_mask,                      # (B, S, H, W)
-        extrinsics=extr,                            # (B, S, 4, 4) or (B, S, 3, 4)
-        intrinsics=intr,                            # (B, S, 3, 3)
-        H=H, W=W,
-    )
-"""
 
 import torch
 import torch.nn.functional as F
@@ -79,7 +53,7 @@ def _project_world_to_pixel(xyz_world, extr_4x4, intr_3x3):
     B, N, _ = xyz_world.shape
     S = extr_4x4.shape[1]
 
-    # World → camera. Need homogeneous coords.
+    # World -> camera. Need homogeneous coords.
     xyz_h = torch.cat([xyz_world, torch.ones(B, N, 1, device=xyz_world.device,
                                              dtype=xyz_world.dtype)], dim=-1)  # (B, N, 4)
     # (B, S, 4, 4) @ (B, S, 4, N) = (B, S, 4, N), broadcast xyz over S
@@ -115,8 +89,8 @@ def _grid_sample_xyz(xyz_per_frame, pixel_uv, H, W):
     N = pixel_uv.shape[2]
 
     # Normalize pixel coords to [-1, 1] for grid_sample
-    # pixel u in [0, W-1] → norm_x in [-1, 1]
-    # pixel v in [0, H-1] → norm_y in [-1, 1]
+    # pixel u in [0, W-1] -> norm_x in [-1, 1]
+    # pixel v in [0, H-1] -> norm_y in [-1, 1]
     u = pixel_uv[..., 0]                                                        # (B, S, N)
     v = pixel_uv[..., 1]
     valid_uv = (u >= 0) & (u <= W - 1) & (v >= 0) & (v <= H - 1)
@@ -253,7 +227,7 @@ def compute_xyz_consistency_loss(
             mask_other_b = mask_b[b:b+1, other_indices]                          # (1, S_o, H, W)
             S_o = len(other_indices)
             # Gather mask values at (v_int, u_int)
-            # Flatten: mask_other_b → (1*S_o, H, W)
+            # Flatten: mask_other_b -> (1*S_o, H, W)
             mask_flat = mask_other_b.reshape(S_o, H, W)
             v_flat    = v_int.reshape(S_o, Nl)
             u_flat    = u_int.reshape(S_o, Nl)

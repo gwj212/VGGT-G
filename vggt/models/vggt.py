@@ -1,15 +1,3 @@
-# vggt/models/vggt.py  — v16 + depth_head 梯度 checkpoint (省显存, 让 5v 深度解冻不 OOM)
-#
-# 相对你给的 v16 唯一改动: depth_head 可训练(Stage-2)时, 对它的前向做梯度 checkpoint,
-#   反向时重算 depth_head 前向以省下它的激活显存(代价≈多一次 depth_head 前向)。
-#   → 让 "特征头 + 深度头同时解冻" 也能在 5 视角跑(否则 OOM, 之前被迫降到 3v)。
-#
-#   ★ 默认关 (VGGT_DEPTH_GRAD_CKPT != '1' 且 model._depth_grad_checkpoint 未设)
-#     → 逐值等价你给的 v16, 不动任何已有实验。
-#   ★ 仅在 self.training 且 depth_head 真可训练时启用 (eval / 冻结时零成本)。
-#   ★ 开启: 启动加环境变量 VGGT_DEPTH_GRAD_CKPT=1 (无需改训练脚本)。
-#
-# 其余与 v16 完全一致。
 
 import os
 import torch
@@ -26,7 +14,7 @@ from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
 
 # ============================================================
-# Torch 版本的 depth -> world unproject (与 v16 一致)
+# Torch version of depth -> world unproject
 # ============================================================
 
 def unproject_depth_to_world_torch(
@@ -140,8 +128,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             self.gaussian_head = None
 
         self._xyz_base_source_logged = False
-        self._feat_grad_logged = False   # ★ v16: 首次 forward 打印一次特征头梯度通路状态
-        self._depth_ckpt_logged = False   # ★ 首次 forward 打印一次 depth checkpoint 状态
+        self._feat_grad_logged = False   
+        self._depth_ckpt_logged = False   
 
     def forward(self, images: torch.Tensor, query_points: torch.Tensor = None):
         if images.dim() == 4:
@@ -162,8 +150,6 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 predictions["pose_enc_list"] = pose_enc_list
 
             if self.depth_head is not None:
-                # ★ depth_head 可训练(Stage-2)时, 做梯度 checkpoint 省激活显存 → 5v 不 OOM。
-                #   默认关(env VGGT_DEPTH_GRAD_CKPT!=1 且未设 _depth_grad_checkpoint)= 逐值等价 v16。
                 _depth_trainable = (self.training and
                                     any(p.requires_grad for p in self.depth_head.parameters()))
                 _use_depth_ckpt = (_depth_trainable and
@@ -182,8 +168,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                         return self.depth_head(list(_tokens), images=_imgs,
                                                patch_start_idx=_psi)
 
-                    # use_reentrant=False: 支持非张量输出 + 正确保留 autocast 状态;
-                    # depth_head 的参数虽不在入参里, 其梯度照常累积(标准用法)。
+                 
                     depth, depth_conf = _torch_ckpt.checkpoint(
                         _run_depth_head, images, *aggregated_tokens_list,
                         use_reentrant=False,
@@ -197,9 +182,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 predictions["depth"] = depth
                 predictions["depth_conf"] = depth_conf
 
-                # ★ Stage-2: 冻结深度参照, 给锚定正则 ‖depth - depth_frozen‖ 用。
-                #   仅当训练脚本注入了 self._depth_head_frozen 且在 training 时才算
-                #   (eval / 未解冻深度时零成本)。frozen 输出在 no_grad 下, 天然 detach。
+            
                 _dhf = getattr(self, '_depth_head_frozen', None)
                 if _dhf is not None and self.training:
                     with torch.no_grad():
@@ -220,11 +203,9 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 predictions["world_points_conf"] = pts3d_conf
 
             # ============================================================
-            # GaussianHead — ★ v16 关键改动 ★
+            # GaussianHead branch
             # ============================================================
             if self.gaussian_head is not None and self.dpt_feature_head is not None:
-                # ★ v16: 给特征头的 tokens 先 detach → aggregator(backbone) 永远不收梯度,
-                #   无论 backbone 是否冻结都安全。
                 _agg_tokens_for_feat = [t.detach() for t in aggregated_tokens_list]
                 dpt_feats = self.dpt_feature_head(
                     _agg_tokens_for_feat,
@@ -232,7 +213,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                     patch_start_idx=patch_start_idx,
                 )
 
-                # ★★★ xyz_base 来源决策(支持环境变量切换, 同 v15.1)★★★
+
                 _xyz_src = os.environ.get(
                     'VGGT_XYZ_BASE_SOURCE', 'depth_unproject'
                 ).strip().lower()
@@ -274,12 +255,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                             device=images.device, dtype=images.dtype,
                         )
 
-                # ─────────────────────────────────────────────────────────
-                # ★ v16 改动核心:
-                #   - dpt_feats 不再 .detach() → render loss 可训 dpt_feature_head
-                #   - xyz_base 是否 detach 由 model._release_depth 控制(延迟解冻)
-                #   - input_images 仍 .detach()
-                # ─────────────────────────────────────────────────────────
+         
                 _release_depth = getattr(self, '_release_depth', False)
                 _xyz_for_gh = xyz_base if _release_depth else xyz_base.detach()
 
@@ -288,17 +264,17 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                     _dep_train = (self.depth_head is not None
                                   and any(p.requires_grad for p in self.depth_head.parameters()))
                     print(
-                        f"[VGGT] dpt_feats 梯度通路已开 (v16); dpt_feature_head "
-                        f"{'可训练' if _trainable else '冻结'}; depth_head "
-                        f"{'可训练(Stage-2)' if _dep_train else '冻结'}; "
-                        f"xyz_base 解冻={_release_depth}",
+                        f"[VGGT] dpt_feats gradient path ON; dpt_feature_head "
+                        f"{'trainable' if _trainable else 'frozen'}; depth_head "
+                        f"{'trainable' if _dep_train else 'frozen'}; "
+                        f"xyz_base released={_release_depth}",
                         flush=True,
                     )
                     self._feat_grad_logged = True
 
                 gaussians = self.gaussian_head(
-                    dpt_feats,                       # ★ v16: 不再 .detach()
-                    _xyz_for_gh,                     # ★ Stage-2: _release_depth=True 时不 detach
+                    dpt_feats,
+                    _xyz_for_gh,
                     input_images=images.detach(),
                 )
                 predictions["gaussians"] = gaussians

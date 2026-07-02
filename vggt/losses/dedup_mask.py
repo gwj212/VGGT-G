@@ -1,19 +1,3 @@
-# vggt/losses/dedup_mask.py
-# ============================================================
-# Per-pixel surface/fog mask, 用于 opacity 监督
-#
-# 两种实现:
-#   compute_dedup_mask_image_domain  (★ 推荐, 速度快, 用 depth_conf 排序)
-#   compute_dedup_mask_voxel         (慢, O(M²) KNN, 不适合 1M+ 点)
-#
-# 改动 v2.1 (相对 v2):
-#   1. image_domain 的 depth_rel_tol 默认放宽 0.10 → 0.20,
-#      让更多投影对齐到位置进入 conf 竞争 (减少误判遮挡)。
-#   2. voxel 的 knn_k 默认 16 → 8, query_chunk 256 → 512,
-#      速度提升一倍 (法线估计粗一点可接受)。
-#   3. 文档警告: voxel 方案在 M > 5e5 时不适合训练循环.
-# ============================================================
-
 import torch
 import torch.nn.functional as F
 
@@ -26,19 +10,20 @@ def compute_dedup_mask_image_domain(
     intrinsics,        # (B, S, 3, 3)
     H, W,
     z_near=0.05,
-    depth_rel_tol=0.20,      # ★ v2.1: 0.10 → 0.20, 更宽容
+    depth_rel_tol=0.20,
     fallback_max_ratio=0.80,
     verbose=False,
 ):
-    """
-    图像域代表性分配:
-      对每个 src 像素的世界点 P, 投到每个 obs 帧:
-        in_fov & not_occluded & (obs.conf > src.conf) → src 让位
+    """Image-domain representative assignment.
 
-    Fallback:
-      mask 比例 > fallback_max_ratio → 退化为全保留 (让 balance loss 接管)
+    For each source pixel's world point P, project it into every observer
+    frame. If it is in-FOV, not occluded, and the observer has higher depth
+    confidence, the source pixel yields (mask=0).
 
-    速度: ~50-100ms / batch, S=5, H=W=518
+    Fallback: if the kept ratio exceeds fallback_max_ratio the mask degrades
+    to all-keep (letting the balance loss take over).
+
+    Speed: ~50-100 ms / batch for S=5, H=W=518.
     """
     B, S, _, _, _ = xyz_base.shape
     device = xyz_base.device
@@ -98,14 +83,13 @@ def compute_dedup_mask_image_domain(
 
             mask[:, s].view(B, H * W)[src_loses] = 0.0
 
-    # Fallback: mask 比例过高 → 退化为全保留
+    # Fallback: if the kept ratio is too high, keep everything.
     for b in range(B):
         ratio = mask[b].mean()
         if ratio > fallback_max_ratio:
             if verbose:
                 print(f"  [image-mask fallback] batch {b}: "
-                      f"ratio={ratio*100:.1f}% > {fallback_max_ratio*100:.0f}%, "
-                      f"退化为全保留")
+                      f"ratio={ratio*100:.1f}% > {fallback_max_ratio*100:.0f}%, keep all")
             mask[b] = 1.0
 
     return mask
@@ -117,17 +101,16 @@ def compute_dedup_mask_voxel(
     depth_conf,
     voxel_size=0.02,
     normal_voxel_ratio=3.0,
-    knn_k=8,                # ★ v2.1: 16 → 8
-    query_chunk=512,        # ★ v2.1: 256 → 512
+    knn_k=8,
+    query_chunk=512,
     fallback_min_ratio=0.15,
     verbose=False,
 ):
-    """
-    Voxel 方案: 法线方向各向异性体素 + 同体素 argmax(conf).
+    """Voxel method: normal-aligned anisotropic voxels + argmax(conf) per voxel.
 
-    ⚠️ 警告: KNN 复杂度 O(M²), M = S*H*W.
-    M ≈ 1.34M (S=5, H=W=518) 时, 单次 mask 耗时 30-60 秒,
-    训练循环里不可用. 仅作离线诊断 / 小规模实验用.
+    WARNING: KNN complexity is O(M^2), M = S*H*W. For M ~ 1.34M (S=5,
+    H=W=518) a single mask takes 30-60 s, unusable in a training loop.
+    For offline diagnostics / small-scale experiments only.
     """
     B, S, H, W, _ = xyz_base.shape
     device = xyz_base.device
@@ -189,8 +172,7 @@ def compute_dedup_mask_voxel(
         if ratio < fallback_min_ratio:
             if verbose:
                 print(f"  [voxel-mask fallback] batch {b}: "
-                      f"ratio={ratio*100:.1f}% < {fallback_min_ratio*100:.0f}%, "
-                      f"退化为全保留")
+                      f"ratio={ratio*100:.1f}% < {fallback_min_ratio*100:.0f}%, keep all")
             result[b] = 1.0
 
     return result
@@ -199,7 +181,7 @@ def compute_dedup_mask_voxel(
 def compute_dedup_mask(method, xyz_base, depth_conf,
                        extrinsics=None, intrinsics=None,
                        H=None, W=None, verbose=False, **kwargs):
-    """统一入口."""
+    """Unified entry point."""
     if method == 'image':
         return compute_dedup_mask_image_domain(
             xyz_base, depth_conf, extrinsics, intrinsics, H, W,
